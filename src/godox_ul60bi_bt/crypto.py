@@ -13,8 +13,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import cmac
+from cryptography.hazmat.primitives.asymmetric.ec import (
+    ECDH,
+    SECP256R1,
+    EllipticCurvePrivateKey,
+    EllipticCurvePublicNumbers,
+    generate_private_key,
+)
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESCCM
 
@@ -210,6 +216,103 @@ def k4(app_key: bytes) -> int:
     return t2[15] & 0x3F
 
 
+def k1(N: bytes, SALT: bytes, P: bytes) -> bytes:
+    """BT Mesh k1 key derivation (Section 3.8.2.2).
+
+    T  = AES-CMAC(key=SALT, data=N)
+    k1 = AES-CMAC(key=T, data=P)
+    """
+    T = aes_cmac(SALT, N)
+    return aes_cmac(T, P)
+
+
+def s1(M: bytes) -> bytes:
+    """BT Mesh s1 SALT generation: AES-CMAC(key=bytes(16), data=M)."""
+    return aes_cmac(bytes(16), M)
+
+
+def build_confirmation_inputs(
+    invite_payload: bytes,
+    capabilities_payload: bytes,
+    start_payload: bytes,
+    provisioner_pubkey: bytes,
+    device_pubkey: bytes,
+) -> bytes:
+    """Build ConfirmationInputs (145 bytes) for BT Mesh provisioning confirmation."""
+    result = invite_payload + capabilities_payload + start_payload + provisioner_pubkey + device_pubkey
+    if len(result) != 145:
+        raise ValueError(f"ConfirmationInputs must be 145 bytes, got {len(result)}")
+    return result
+
+
+def compute_confirmation_salt(confirmation_inputs: bytes) -> bytes:
+    """ConfirmationSalt = s1(ConfirmationInputs)."""
+    return s1(confirmation_inputs)
+
+
+def compute_confirmation_value(
+    ecdh_secret: bytes,
+    confirmation_salt: bytes,
+    random_16: bytes,
+    auth_value: bytes = b"\x00" * 16,
+) -> bytes:
+    """Compute provisioner Confirmation value.
+
+    ConfirmationKey = k1(ECDHSecret, ConfirmationSalt, b"prck")
+    Confirmation    = aes_cmac(ConfirmationKey, random_16 + auth_value)
+    """
+    confirmation_key = k1(ecdh_secret, confirmation_salt, b"prck")
+    return aes_cmac(confirmation_key, random_16 + auth_value)
+
+
+def compute_provision_salt(
+    confirmation_salt: bytes,
+    provisioner_random: bytes,
+    device_random: bytes,
+) -> bytes:
+    """ProvisionSalt = s1(ConfirmationSalt + provisioner_random + device_random)."""
+    return s1(confirmation_salt + provisioner_random + device_random)
+
+
+def derive_session_key(ecdh_secret: bytes, provision_salt: bytes) -> bytes:
+    """SessionKey = k1(ECDHSecret, ProvisionSalt, b'prsk')."""
+    return k1(ecdh_secret, provision_salt, b"prsk")
+
+
+def derive_session_nonce(ecdh_secret: bytes, provision_salt: bytes) -> bytes:
+    """SessionNonce = k1(ECDHSecret, ProvisionSalt, b'prsn')[3:] = 13 bytes."""
+    return k1(ecdh_secret, provision_salt, b"prsn")[3:]
+
+
+def derive_device_key(ecdh_secret: bytes, provision_salt: bytes) -> bytes:
+    """DeviceKey = k1(ECDHSecret, ProvisionSalt, b'prdk')."""
+    return k1(ecdh_secret, provision_salt, b"prdk")
+
+
+def encrypt_provisioning_data(
+    net_key: bytes,
+    key_index: int,
+    flags: int,
+    iv_index: int,
+    unicast_address: int,
+    session_key: bytes,
+    session_nonce: bytes,
+) -> bytes:
+    """Encrypt BT Mesh provisioning data (25-byte plaintext → 33-byte ciphertext+tag).
+
+    Returns 33 bytes (25 ciphertext + 8-byte AES-CCM tag).
+    """
+    plaintext = (
+        net_key
+        + key_index.to_bytes(2, "big")
+        + bytes([flags])
+        + iv_index.to_bytes(4, "big")
+        + unicast_address.to_bytes(2, "big")
+    )
+    aesccm = AESCCM(session_key, tag_length=8)
+    return aesccm.encrypt(session_nonce, plaintext, None)
+
+
 def aes_ccm_encrypt(
     key: bytes,
     nonce: bytes,
@@ -317,7 +420,7 @@ def obfuscate(pdu: bytes, privacy_key: bytes, iv_index: int) -> bytes:
     iv_index_bytes = iv_index.to_bytes(4, "big")
     privacy_plaintext = bytes(5) + iv_index_bytes + privacy_random
 
-    cipher = Cipher(algorithms.AES(privacy_key), modes.ECB(), backend=default_backend())
+    cipher = Cipher(algorithms.AES(privacy_key), modes.ECB())
     encryptor = cipher.encryptor()
     pecb = encryptor.update(privacy_plaintext) + encryptor.finalize()
 
@@ -750,6 +853,74 @@ def pack_proxy_config_pdu(
     return bytes([0x02]) + obfuscate(network_pdu, priv_key, iv_index)
 
 
+def pack_proxy_device_key_pdu(
+    access_payload: bytes,
+    net_key: bytes,
+    device_key: bytes,
+    iv_index: int,
+    seq: int,
+    src: int,
+    dst: int,
+    ttl: int = 10,
+) -> bytes:
+    """Pack a complete Mesh Proxy Network PDU using the device key (Config Server path).
+
+    Parameters
+    ----------
+    access_payload
+        Plain Config Server access payload bytes, such as the output of
+        :func:`godox_ul60bi_bt.config.build_config_app_key_add`.
+    net_key
+        16-byte Bluetooth Mesh Network Key.
+    device_key
+        16-byte Bluetooth Mesh Device Key.
+    iv_index
+        Bluetooth Mesh IV Index.
+    seq
+        Mesh sequence number.
+    src
+        Mesh source unicast address.
+    dst
+        Mesh destination address.
+    ttl
+        Mesh Time To Live value.
+
+    Returns
+    -------
+    bytes
+        Complete Proxy SAR/type byte ``0x00`` followed by an obfuscated Network
+        PDU whose upper transport layer is encrypted with the device key.
+
+    Examples
+    --------
+    >>> net_key = bytes.fromhex("98b2e7ef8211c6deca2401adbe52e715")
+    >>> device_key = bytes(range(16))
+    >>> pdu = pack_proxy_device_key_pdu(b"abc", net_key, device_key, 0, 1, 1, 2)
+    >>> pdu[0]
+    0
+    """
+    nid, enc_key, priv_key = k2(net_key)
+
+    encrypted_access = encrypt_device_key_pdu(
+        payload=access_payload,
+        device_key=device_key,
+        iv_index=iv_index,
+        seq=seq,
+        src=src,
+        dst=dst,
+    )
+    encrypted_net_header_and_data = encrypt_network_pdu(
+        dst, encrypted_access, enc_key, iv_index, seq, src, ttl
+    )
+
+    ivi = iv_index & 1
+    byte0 = (ivi << 7) | nid
+    network_pdu = bytes([byte0]) + encrypted_net_header_and_data
+    obf_pdu = obfuscate(network_pdu, priv_key, iv_index)
+
+    return bytes([0x00]) + obf_pdu  # Proxy SAR=0, Type=0
+
+
 def encode_vendor_opcode(opcode: int) -> bytes:
     """Encode a 24-bit vendor opcode in Telink little-endian order.
 
@@ -890,3 +1061,39 @@ def decrypt_device_key_pdu(
         + iv_index.to_bytes(4, "big")
     )
     return aes_ccm_decrypt(device_key, nonce, encrypted[1:], 4)
+
+
+def generate_p256_keypair() -> tuple[EllipticCurvePrivateKey, bytes]:
+    """Generate a P-256 keypair.
+
+    Returns
+    -------
+    tuple[EllipticCurvePrivateKey, bytes]
+        ``(private_key, public_key_bytes)`` where ``public_key_bytes`` is
+        X (32 bytes big-endian) + Y (32 bytes big-endian) = 64 bytes total.
+    """
+    private_key = generate_private_key(SECP256R1())
+    nums = private_key.public_key().public_numbers()
+    pub_bytes = nums.x.to_bytes(32, "big") + nums.y.to_bytes(32, "big")
+    return private_key, pub_bytes
+
+
+def ecdh_shared_secret(private_key: EllipticCurvePrivateKey, peer_pub_bytes: bytes) -> bytes:
+    """Compute ECDH shared secret from our private key and peer's raw 64-byte public key.
+
+    Parameters
+    ----------
+    private_key
+        A ``cryptography`` EllipticCurvePrivateKey (P-256).
+    peer_pub_bytes
+        64-byte raw public key: X (32 bytes) + Y (32 bytes).
+
+    Returns
+    -------
+    bytes
+        32-byte shared secret.
+    """
+    x = int.from_bytes(peer_pub_bytes[:32], "big")
+    y = int.from_bytes(peer_pub_bytes[32:], "big")
+    peer_pub = EllipticCurvePublicNumbers(x, y, SECP256R1()).public_key()
+    return private_key.exchange(ECDH(), peer_pub)

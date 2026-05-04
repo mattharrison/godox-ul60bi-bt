@@ -115,3 +115,35 @@ async def test_scan_handles_empty_results() -> None:
         return {}
 
     assert await scan(discover=fake_discover) == []
+
+
+def test_scan_unprovisioned_returns_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """scan_unprovisioned returns a list of DiscoveredDevice."""
+    import asyncio
+    from godox_ul60bi_bt.scanner import scan_unprovisioned
+
+    async def fake_scan(service_uuids: list[str], timeout: float) -> list[object]:
+        from unittest.mock import MagicMock
+        dev = MagicMock()
+        dev.name = "GD_LED_UNPROV"
+        dev.address = "AA:BB:CC:DD:EE:FF"
+        return [dev]
+
+    monkeypatch.setattr("godox_ul60bi_bt.scanner.BleakScanner.discover", fake_scan)
+    results = asyncio.run(scan_unprovisioned(timeout=3.0))
+    assert isinstance(results, list)
+
+
+def test_scan_unprovisioned_uses_provisioning_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """scan_unprovisioned filters on service UUID 0x1827."""
+    import asyncio
+    from godox_ul60bi_bt.scanner import scan_unprovisioned
+    captured: dict[str, list[str]] = {}
+
+    async def fake_scan(service_uuids: list[str], timeout: float) -> list[object]:
+        captured["uuids"] = service_uuids
+        return []
+
+    monkeypatch.setattr("godox_ul60bi_bt.scanner.BleakScanner.discover", fake_scan)
+    asyncio.run(scan_unprovisioned(timeout=1.0))
+    assert any("1827" in str(u).lower() for u in captured.get("uuids", []))

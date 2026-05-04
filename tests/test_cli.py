@@ -877,3 +877,156 @@ def test_rebind_controller_raises_without_device_key(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="device_key"):
         asyncio.run(controller.rebind())
+
+
+# --- provision subcommand tests ---
+
+
+class FakeProvisioningSession:
+    def __init__(self, address: str, net_key: bytes, key_index: int, iv_index: int, unicast_address: int, **kwargs: Any) -> None:
+        self.address = address
+
+    async def run(self) -> MeshState:
+        return MeshState(
+            network_key="aa" * 16,
+            app_key="bb" * 16,
+            device_key="cc" * 16,
+            provisioner_address=1,
+            node_address=0x0002,
+            iv_index=0,
+            sequence_number=1,
+        )
+
+
+def test_provision_subcommand_saves_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """provision saves MeshState to --output file."""
+    import json
+    from godox_ul60bi_bt.cli import sync_main
+    from godox_ul60bi_bt.scanner import DiscoveredDevice, Advertisement
+
+    output = tmp_path / "state.json"
+
+    async def fake_scan_unprovisioned(timeout: float = 10.0) -> list[DiscoveredDevice]:
+        return [DiscoveredDevice(name="GD_LED", address="AA:BB:CC:DD:EE:FF", rssi=None, advertisement=Advertisement(), likely_godox=False)]
+
+    monkeypatch.setattr("godox_ul60bi_bt.cli.scan_unprovisioned", fake_scan_unprovisioned)
+    monkeypatch.setattr("godox_ul60bi_bt.cli.ProvisioningSession", FakeProvisioningSession)
+
+    sync_main(["provision", "--output", str(output)])
+
+    assert output.exists()
+    data = json.loads(output.read_text())
+    assert "network_key" in data or "device_key" in data
+
+
+def test_provision_subcommand_with_address(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """provision --address skips scanning."""
+    from godox_ul60bi_bt.cli import sync_main
+
+    output = tmp_path / "state.json"
+    scan_called: list[bool] = []
+
+    async def fake_scan_unprovisioned(timeout: float = 10.0) -> list[DiscoveredDevice]:
+        scan_called.append(True)
+        return []
+
+    monkeypatch.setattr("godox_ul60bi_bt.cli.scan_unprovisioned", fake_scan_unprovisioned)
+    monkeypatch.setattr("godox_ul60bi_bt.cli.ProvisioningSession", FakeProvisioningSession)
+
+    sync_main(["provision", "--address", "AA:BB:CC:DD:EE:FF", "--output", str(output)])
+
+    assert not scan_called  # No scan when address given
+
+
+# ---------------------------------------------------------------------------
+# device_address caching tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_controller_uses_device_address_from_state_skipping_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the state file has device_address, no scan should happen."""
+    from godox_ul60bi_bt.cli import _get_controller
+
+    state_path = tmp_path / "mesh_state.json"
+    MeshState(
+        network_key="bc6bf99f840f9ca379562468a110d2a9",
+        app_key="9f360e3d7d27a7e9aa56ab7342f1e3e4",
+        provisioner_address=1,
+        node_address=2,
+        sequence_number=100,
+        iv_index=0,
+        device_address="SAVED-DEVICE-ID",
+    ).save(state_path)
+
+    scan_called: list[bool] = []
+
+    async def fake_scan(*, timeout: float) -> list[DiscoveredDevice]:
+        scan_called.append(True)
+        return []
+
+    args = argparse.Namespace(
+        device=None,
+        state=str(state_path),
+        network_key=None,
+        app_key=None,
+        provisioner_address=None,
+        node_address=None,
+        sequence_number=None,
+        iv_index=None,
+    )
+
+    controller = await _get_controller(args, fake_scan)
+
+    assert not scan_called, "scan should be skipped when state has device_address"
+    assert controller.address == "SAVED-DEVICE-ID"
+
+
+@pytest.mark.asyncio
+async def test_get_controller_saves_device_address_to_state_after_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a scan finds a device, device_address is persisted to the state file."""
+    from godox_ul60bi_bt.cli import _get_controller
+
+    state_path = tmp_path / "mesh_state.json"
+    MeshState(
+        network_key="bc6bf99f840f9ca379562468a110d2a9",
+        app_key="9f360e3d7d27a7e9aa56ab7342f1e3e4",
+        provisioner_address=1,
+        node_address=2,
+        sequence_number=100,
+        iv_index=0,
+    ).save(state_path)
+
+    async def fake_scan(*, timeout: float) -> list[DiscoveredDevice]:
+        return [
+            DiscoveredDevice(
+                name="GD_LED",
+                address="DISCOVERED-DEVICE-ID",
+                rssi=-55,
+                advertisement=Advertisement(local_name="GD_LED"),
+                likely_godox=True,
+            )
+        ]
+
+    args = argparse.Namespace(
+        device=None,
+        state=str(state_path),
+        network_key=None,
+        app_key=None,
+        provisioner_address=None,
+        node_address=None,
+        sequence_number=None,
+        iv_index=None,
+    )
+
+    controller = await _get_controller(args, fake_scan)
+
+    assert controller.address == "DISCOVERED-DEVICE-ID"
+    saved = MeshState.load(state_path)
+    assert saved.device_address == "DISCOVERED-DEVICE-ID"

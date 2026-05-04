@@ -117,3 +117,198 @@ def test_encrypt_device_key_pdu_different_seq_produces_different_ciphertext() ->
     enc1 = encrypt_device_key_pdu(plaintext, device_key, 0, 100, 0x0001, 0x0002)
     enc2 = encrypt_device_key_pdu(plaintext, device_key, 0, 101, 0x0001, 0x0002)
     assert enc1 != enc2
+
+
+def test_k1_basic() -> None:
+    """k1 test vector from BT Mesh spec section 8.1.2."""
+    from godox_ul60bi_bt.crypto import k1, aes_cmac
+
+    N    = bytes.fromhex("3216d1509884b533248541792b877f98")
+    SALT = bytes.fromhex("2ba14ffa0df84a2831938d57d276cab4")
+    P    = b"smk2"
+    result = k1(N, SALT, P)
+    T = aes_cmac(SALT, N)
+    expected = aes_cmac(T, P)
+    assert result == expected
+
+
+def test_k1_provisioning_labels() -> None:
+    """k1 with provisioning labels produces 16-byte results."""
+    from godox_ul60bi_bt.crypto import k1
+
+    secret = bytes(32)
+    salt   = bytes(16)
+    for label in (b"prsk", b"prsn", b"prdk", b"prck"):
+        result = k1(secret, salt, label)
+        assert len(result) == 16
+
+
+def test_k1_session_nonce_is_bytes_3_to_15() -> None:
+    """Session nonce is k1(secret, salt, b'prsn')[3:]."""
+    from godox_ul60bi_bt.crypto import k1
+
+    full = k1(bytes(32), bytes(16), b"prsn")
+    nonce = full[3:]
+    assert len(nonce) == 13
+
+
+def test_generate_p256_keypair_returns_bytes() -> None:
+    from godox_ul60bi_bt.crypto import generate_p256_keypair
+
+    private_key, pub_bytes = generate_p256_keypair()
+    assert len(pub_bytes) == 64
+
+
+def test_ecdh_shared_secret_is_32_bytes() -> None:
+    from godox_ul60bi_bt.crypto import generate_p256_keypair, ecdh_shared_secret
+
+    priv_a, pub_a = generate_p256_keypair()
+    priv_b, pub_b = generate_p256_keypair()
+    secret_ab = ecdh_shared_secret(priv_a, pub_b)
+    secret_ba = ecdh_shared_secret(priv_b, pub_a)
+    assert len(secret_ab) == 32
+    assert secret_ab == secret_ba
+
+
+def test_ecdh_different_pairs_produce_different_secrets() -> None:
+    from godox_ul60bi_bt.crypto import generate_p256_keypair, ecdh_shared_secret
+
+    priv_a, pub_a = generate_p256_keypair()
+    priv_b, pub_b = generate_p256_keypair()
+    priv_c, pub_c = generate_p256_keypair()
+    assert ecdh_shared_secret(priv_a, pub_b) != ecdh_shared_secret(priv_a, pub_c)
+
+
+# PROV-CRYPTO-03: Confirmation value computation
+
+
+def test_compute_confirmation_salt_length() -> None:
+    from godox_ul60bi_bt.crypto import compute_confirmation_salt
+
+    inputs = bytes(145)
+    salt = compute_confirmation_salt(inputs)
+    assert len(salt) == 16
+
+
+def test_compute_confirmation_salt_uses_s1() -> None:
+    """confirmation_salt = s1(confirmation_inputs)."""
+    from godox_ul60bi_bt.crypto import compute_confirmation_salt, s1
+
+    inputs = bytes(range(145))
+    assert compute_confirmation_salt(inputs) == s1(inputs)
+
+
+def test_compute_confirmation_value_length() -> None:
+    from godox_ul60bi_bt.crypto import compute_confirmation_value
+
+    ecdh_secret = bytes(32)
+    conf_salt = bytes(16)
+    random_16 = bytes(16)
+    result = compute_confirmation_value(ecdh_secret, conf_salt, random_16)
+    assert len(result) == 16
+
+
+def test_compute_confirmation_value_deterministic() -> None:
+    from godox_ul60bi_bt.crypto import compute_confirmation_value
+
+    secret = bytes(range(32))
+    salt = bytes(range(16))
+    rand = bytes(range(16, 32))
+    r1 = compute_confirmation_value(secret, salt, rand)
+    r2 = compute_confirmation_value(secret, salt, rand)
+    assert r1 == r2
+
+
+def test_build_confirmation_inputs_length() -> None:
+    from godox_ul60bi_bt.crypto import build_confirmation_inputs
+
+    invite = bytes([0x00])
+    caps = bytes(11)
+    start = bytes([0, 0, 0, 0, 0])
+    prov_pk = bytes(64)
+    dev_pk = bytes(64)
+    result = build_confirmation_inputs(invite, caps, start, prov_pk, dev_pk)
+    assert len(result) == 145
+    assert result == invite + caps + start + prov_pk + dev_pk
+
+
+# PROV-CRYPTO-04: Session key, nonce, device key, data encryption
+
+
+def test_compute_provision_salt_length() -> None:
+    from godox_ul60bi_bt.crypto import compute_provision_salt
+
+    conf_salt = bytes(16)
+    prov_rand = bytes(16)
+    dev_rand = bytes(16)
+    result = compute_provision_salt(conf_salt, prov_rand, dev_rand)
+    assert len(result) == 16
+
+
+def test_derive_session_key_length() -> None:
+    from godox_ul60bi_bt.crypto import derive_session_key
+
+    secret = bytes(32)
+    salt = bytes(16)
+    assert len(derive_session_key(secret, salt)) == 16
+
+
+def test_derive_session_nonce_is_13_bytes() -> None:
+    from godox_ul60bi_bt.crypto import derive_session_nonce
+
+    secret = bytes(32)
+    salt = bytes(16)
+    nonce = derive_session_nonce(secret, salt)
+    assert len(nonce) == 13
+
+
+def test_derive_device_key_length() -> None:
+    from godox_ul60bi_bt.crypto import derive_device_key
+
+    secret = bytes(32)
+    salt = bytes(16)
+    assert len(derive_device_key(secret, salt)) == 16
+
+
+def test_encrypt_provisioning_data_length() -> None:
+    """Encrypted provisioning data = 25 bytes plaintext + 8-byte tag = 33 bytes."""
+    from godox_ul60bi_bt.crypto import encrypt_provisioning_data
+
+    net_key = bytes(16)
+    key_index = 0
+    flags = 0
+    iv_index = 0
+    unicast = 0x0002
+    session_key = bytes(16)
+    session_nonce = bytes(13)
+    ciphertext = encrypt_provisioning_data(
+        net_key, key_index, flags, iv_index, unicast, session_key, session_nonce
+    )
+    assert len(ciphertext) == 33
+
+
+def test_encrypt_provisioning_data_uses_aes_ccm() -> None:
+    """Decrypt with the same key/nonce should recover plaintext."""
+    from godox_ul60bi_bt.crypto import encrypt_provisioning_data
+    from cryptography.hazmat.primitives.ciphers.aead import AESCCM
+
+    net_key = bytes(range(16))
+    key_index = 0x0000
+    flags = 0x00
+    iv_index = 0x00000000
+    unicast = 0x0001
+    session_key = bytes(16)
+    session_nonce = bytes(13)
+    ciphertext = encrypt_provisioning_data(
+        net_key, key_index, flags, iv_index, unicast, session_key, session_nonce
+    )
+    aesccm = AESCCM(session_key, tag_length=8)
+    plaintext = aesccm.decrypt(session_nonce, ciphertext, None)
+    expected = (
+        net_key
+        + key_index.to_bytes(2, "big")
+        + bytes([flags])
+        + iv_index.to_bytes(4, "big")
+        + unicast.to_bytes(2, "big")
+    )
+    assert plaintext == expected

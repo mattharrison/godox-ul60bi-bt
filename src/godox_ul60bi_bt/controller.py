@@ -413,11 +413,12 @@ class GodoxController:
         >>> GodoxController.rebind.__name__
         'rebind'
         """
+        from .config_session import ConfigSession
         if not self.state.device_key:
             raise ValueError(
                 "device_key is not set in mesh state — rebind requires the device key. "
                 "Ensure your mesh_state.json contains a device_key field."
             )
-        raise NotImplementedError(
-            "rebind not yet implemented — run scripts/mesh_rebind2.py manually"
-        )
+        session = ConfigSession(address=self.address, state=self.state)
+        await session.run()
+        logger.info("rebind complete")

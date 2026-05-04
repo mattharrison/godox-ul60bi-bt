@@ -152,6 +152,33 @@ def is_likely_godox_device(device: DiscoveredDevice) -> bool:
     return any(_looks_like_godox_name(name) for name in names)
 
 
+MESH_PROVISIONING_SERVICE_UUID = "00001827-0000-1000-8000-00805f9b34fb"
+
+
+async def scan_unprovisioned(timeout: float = 10.0) -> list[DiscoveredDevice]:
+    """Scan for unprovisioned BT Mesh devices (Mesh Provisioning Service 0x1827).
+
+    Factory-reset the light before calling this — it must be advertising
+    as an unprovisioned beacon.
+    """
+    logger.info("scanning for unprovisioned devices (timeout=%.1fs)", timeout)
+    devices = await BleakScanner.discover(
+        service_uuids=[MESH_PROVISIONING_SERVICE_UUID],
+        timeout=timeout,
+    )
+    logger.info("scan found %d unprovisioned device(s)", len(devices))
+    return [
+        DiscoveredDevice(
+            name=d.name or "",
+            address=d.address,
+            rssi=None,
+            advertisement=Advertisement(),
+            likely_godox=False,
+        )
+        for d in devices
+    ]
+
+
 async def scan(
     *,
     timeout: float = 5.0,

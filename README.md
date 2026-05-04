@@ -1,6 +1,10 @@
 # Godox UL60Bi Bluetooth Tools
 
-Python tools for controlling a Godox UL60Bi Lite over Bluetooth Mesh.
+Python library and CLI for controlling a Godox UL60Bi Lite over Bluetooth Mesh.
+
+The package handles the full lifecycle: provisioning a factory-reset light,
+pushing the application key, and sending brightness/CCT vendor commands — all
+without the Godox iOS/Android app.
 
 The package has a working CLI for setting brightness and color temperature via
 Bluetooth Mesh (Telink SDK, proxy mode). It also includes development tools for
@@ -8,132 +12,201 @@ scanning, inspecting GATT services, parsing BLE captures, and sending raw writes
 
 ## Install
 
-For local development from this checkout:
-
-```bash
-uv sync
-uv run python -m godox_ul60bi_bt --help
-```
-
-When published, install the package into another `uv` project with:
-
 ```bash
 uv add godox-ul60bi-bt
 ```
 
-## Quick Start
-
-Scan for the light:
+Or for local development from this checkout:
 
 ```bash
-uv run python -m godox_ul60bi_bt scan --timeout 5
+uv sync
 ```
 
-Import mesh state from an existing JSON file or Telink shared preferences XML:
+## Quick Start
+
+### First-time setup (factory-reset light)
+
+Provision the light (generates fresh mesh keys and saves `mesh_state.json`):
 
 ```bash
-uv run python -m godox_ul60bi_bt setup --import mesh_state.json
-uv run python -m godox_ul60bi_bt setup --import captures/telink_shared.xml
+godox-ul60bi provision
+```
+
+Push the application key to the device:
+
+```bash
+godox-ul60bi rebind
 ```
 
 Control the light:
 
 ```bash
-uv run python -m godox_ul60bi_bt on --device <device-id>
-uv run python -m godox_ul60bi_bt off --device <device-id>
-uv run python -m godox_ul60bi_bt set --device <device-id> --brightness 50 --cct 5600
+godox-ul60bi set --brightness 80 --cct 4000
+godox-ul60bi on
+godox-ul60bi off
 ```
 
-Use `--dry-run` to build and print the mesh PDU without connecting:
+That's it. No Android app, no key extraction required.
+
+### Subsequent sessions
+
+After first-time setup, `mesh_state.json` persists the keys and sequence
+number. Normal control commands load it automatically:
 
 ```bash
-uv run python -m godox_ul60bi_bt set --device <device-id> --brightness 50 --cct 5600 --dry-run
+godox-ul60bi set --brightness 50 --cct 5600
+```
+
+### Migrating from the Godox app
+
+If you have already provisioned the light with the Godox app and want to use
+this library without re-provisioning, import the mesh state from a Telink
+shared preferences XML (extracted from an Android debug report):
+
+```bash
+godox-ul60bi setup --import captures/telink_shared.xml
 ```
 
 ## Python API
 
-Use `GodoxController` when you want the library to handle Mesh Proxy setup,
-packet packing, and sequence-number persistence:
+Use `GodoxController` as an async context manager:
 
 ```python
 import asyncio
-
 from godox_ul60bi_bt import GodoxController
 
 
 async def main() -> None:
-    async with GodoxController("<device-id>", "mesh_state.json") as light:
+    async with GodoxController("304BCD50-D2C2-4FA6-A666-F4867E54F267", "mesh_state.json") as light:
         await light.power_on()
-        await light.set_params(brightness=50, cct=5600)
+        await light.set_params(brightness=80, cct=4000)
 
 
 asyncio.run(main())
 ```
 
-For lower-level work, protocol helpers are pure functions and do not require
-Bluetooth hardware:
+Provision programmatically:
 
 ```python
-from godox_ul60bi_bt.protocol import build_v2_command
+import asyncio
+import dataclasses
+import os
+from godox_ul60bi_bt.provisioning import ProvisioningSession
+from godox_ul60bi_bt.config_session import ConfigSession
 
-payload = build_v2_command(0xF0, 0x00, bytes([50, 56, 50, 0, 0]))
-print(payload.hex())
+
+async def provision_and_bind(address: str) -> None:
+    net_key = os.urandom(16)
+    app_key = os.urandom(16)
+
+    # Step 1: provision (factory-reset device must be advertising)
+    session = ProvisioningSession(
+        address=address,
+        net_key=net_key,
+        key_index=0,
+        iv_index=0,
+        unicast_address=0x0002,
+    )
+    state = await session.run()
+    state = dataclasses.replace(state, app_key=app_key.hex())
+    state.save("mesh_state.json")
+
+    # Step 2: push app key (device now advertising on 0x1828)
+    await ConfigSession(address=address, state=state).run()
+
+
+asyncio.run(provision_and_bind("304BCD50-D2C2-4FA6-A666-F4867E54F267"))
 ```
 
-The low-level client classes are also available:
+## Commands
 
-- `ProxyClient`: writes and receives Bluetooth Mesh Proxy PDUs through the Mesh Proxy Data In/Data Out characteristics.
-- `UL60BiClient`: performs raw GATT writes and notifications for research workflows.
+```
+godox-ul60bi [-v] {scan,inspect,setup,provision,rebind,on,off,set,raw}
+```
 
-## Why Mesh Proxy Is Required
+### provision
 
-The UL60Bi Lite is controlled as a Bluetooth Mesh node, not as a simple BLE
-peripheral with a brightness characteristic. The BLE connection exposes the
-standard Bluetooth Mesh Proxy service:
+Provision a factory-reset light. Scans for an unprovisioned beacon (Mesh
+Provisioning Service, UUID 0x1827), runs the full BT Mesh PB-GATT provisioning
+exchange, derives the device key, and saves `mesh_state.json`.
 
-- Mesh Proxy Data In: `00002add-0000-1000-8000-00805f9b34fb`
-- Mesh Proxy Data Out: `00002ade-0000-1000-8000-00805f9b34fb`
+```bash
+godox-ul60bi provision
+godox-ul60bi provision --address 304BCD50-D2C2-4FA6-A666-F4867E54F267
+godox-ul60bi provision --net-key <32-hex> --app-key <32-hex> --output my_state.json
+```
 
-High-level commands must therefore be packed as Bluetooth Mesh Network PDUs.
-The proxy acts as the BLE bearer for those mesh packets. On connect, the
-controller starts proxy notifications, echoes the secure network beacon when it
-is available, sets a whitelist filter, and then writes encrypted vendor command
-PDUs to Mesh Proxy Data In.
+Options:
+- `--address`: skip scanning, connect directly
+- `--net-key`: 32-hex network key (default: random)
+- `--app-key`: 32-hex application key (default: random)
+- `--node-addr`: unicast address to assign (default: 2)
+- `--output`: where to save state (default: `./mesh_state.json`)
+- `--timeout`: BLE scan timeout in seconds (default: 10)
 
-This is why raw captured writes are kept separate from stable SDK commands.
-`raw` is useful for research, but normal control should use `on`, `off`, `set`,
-or `GodoxController`, which validate inputs and pack the mesh command correctly.
+After provisioning, run `godox-ul60bi rebind` to push the app key.
 
-## Mesh State
+### rebind
 
-Bluetooth Mesh packets cannot be created from the BLE device identifier alone.
-The library needs mesh state from the provisioning session:
+Push Config App Key Add and Config Model App Bind to the device using the
+device key. Required after every `provision` before vendor commands work.
 
-- 16-byte Network Key, stored as 32 hex characters
-- 16-byte Application Key, stored as 32 hex characters
-- optional 16-byte Device Key, stored as 32 hex characters for Config messages
-- source/provisioner and destination/node unicast addresses
-- IV Index
-- next sequence number
+```bash
+godox-ul60bi rebind
+godox-ul60bi rebind --state my_state.json
+```
 
-Already-provisioned lights cannot reveal these keys over BLE. Import state from
-an existing known-good `mesh_state.json` or from Telink shared preferences
-captured from the app environment.
+### set
 
-The sequence number is security-critical: Bluetooth Mesh devices reject replayed
-or older sequence numbers. This package updates `sequence_number` after every
-proxy config or vendor command it sends.
+Send a CCT/brightness vendor command:
 
-When `--state` is omitted, the CLI looks for mesh state in this order:
+```bash
+godox-ul60bi set --brightness 80 --cct 4000
+godox-ul60bi set --brightness 100 --cct 2900 --verbose
+```
 
-1. `GODOX_UL60BI_BT_STATE`
-2. `./mesh_state.json`
-3. `~/.config/godox-ul60bi-bt/mesh_state.json`
+- `--brightness`: 0–100
+- `--cct`: color temperature in Kelvin (2800–6500)
+- `--seq-bump N`: advance the sequence number by N before sending (RPL recovery)
 
-Use `setup --import` to install state into the user config location. After
-import, normal control commands do not need `--state`.
+### on / off
 
-### State File Format
+```bash
+godox-ul60bi on
+godox-ul60bi off
+```
+
+### scan
+
+Scan for provisioned Godox lights (Mesh Proxy Service, UUID 0x1828):
+
+```bash
+godox-ul60bi scan
+godox-ul60bi scan --timeout 10
+```
+
+### inspect
+
+Enumerate GATT services, characteristics, and descriptors (read-only):
+
+```bash
+godox-ul60bi inspect 304BCD50-D2C2-4FA6-A666-F4867E54F267
+godox-ul60bi inspect 304BCD50-D2C2-4FA6-A666-F4867E54F267 --format markdown
+```
+
+### setup
+
+Import or display mesh state:
+
+```bash
+godox-ul60bi setup --import mesh_state.json
+godox-ul60bi setup --import captures/telink_shared.xml
+godox-ul60bi setup --show
+```
+
+## State File
+
+`mesh_state.json` holds everything needed to control the light:
 
 ```json
 {
@@ -143,118 +216,83 @@ import, normal control commands do not need `--state`.
   "provisioner_address": 1,
   "node_address": 2,
   "iv_index": 0,
-  "sequence_number": 300000
+  "sequence_number": 10
 }
 ```
 
-## Commands
+See `mesh_state.example.json` for a template with placeholder values.
 
-### Logging
+The state file is loaded automatically from the first of:
+1. `--state <path>` CLI flag
+2. `GODOX_UL60BI_BT_STATE` environment variable
+3. `./mesh_state.json`
+4. `~/.config/godox-ul60bi-bt/mesh_state.json`
 
-The CLI accepts repeatable verbosity flags:
+## How It Works
 
-```bash
-uv run python -m godox_ul60bi_bt -v scan
-uv run python -m godox_ul60bi_bt -vv inspect <device-id>
-```
+The UL60Bi Lite is a Bluetooth Mesh node, not a simple BLE peripheral. All
+control commands are sent as encrypted Bluetooth Mesh Network PDUs over the
+standard Mesh Proxy service (UUID 0x1828).
 
-`-v` enables informational logs and `-vv` enables debug logs.
+### Provisioning (first time)
 
-### Set
+When factory-reset, the device advertises the Mesh Provisioning Service (UUID
+0x1827). The `provision` command runs the PB-GATT exchange:
 
-The `set` command sends a CCT/brightness vendor command over Bluetooth Mesh.
+1. **Invite** → device sends **Capabilities**
+2. **Start** + **PublicKey** (P-256 ECDH) → device sends **PublicKey**
+3. ECDH shared secret computed → **Confirmation** exchange
+4. **Random** exchange → session key + device key derived
+5. **Data** (encrypted network key + unicast address) → device sends **Complete**
 
-```bash
-uv run python -m godox_ul60bi_bt set --device <device-id> --brightness 50 --cct 5600
-uv run python -m godox_ul60bi_bt set --device 304BCD50-D2C2-4FA6-A666-F4867E54F267 --brightness 100 --cct 2900
-uv run python -m godox_ul60bi_bt set --device <device-id> --brightness 50 --cct 5600 --dry-run
-```
+The device key is derived from the ECDH session and is used for Config Server
+messages (App Key Add, Model App Bind).
 
-- `--brightness`: 0-100
-- `--cct`: color temperature in Kelvin, usually 2800-6500
-- `--dry-run`: print the packed PDU hex without connecting
+### Rebind (after every provision)
 
-The command reads and updates `mesh_state.json` automatically. Three sequence
-numbers are consumed per call: proxy filter type, whitelist add, and vendor
-command.
+After provisioning, the device knows the network key but has no application key
+bound to the vendor model. `rebind` connects over the Mesh Proxy service and
+sends:
 
-### Scan
+1. **Config App Key Add** — pushes the app key, encrypted with the device key
+2. **Config Model App Bind** — binds the app key to the Telink vendor model
 
-```bash
-uv run python -m godox_ul60bi_bt scan --timeout 5
-```
+### Vendor Commands
 
-The observed UL60Bi Lite advertises as `GD_LED` on this Mac. macOS reports an
-opaque platform identifier rather than a stable Bluetooth MAC address.
-
-### Inspect
-
-```bash
-uv run python -m godox_ul60bi_bt inspect <device-id> --format markdown
-```
-
-Inspection is read-only. It enumerates GATT services, characteristics,
-descriptors, and properties.
-
-### Parse Android Capture
-
-Use Android Bluetooth HCI snoop logging with the official Godox Light app, then
-convert the extracted snoop log with `tshark`:
-
-```bash
-tshark -r captures/btsnoop_hci.log -Y "btatt.opcode == 0x12 || btatt.opcode == 0x52" -T json > captures/godox-att-writes.json
-uv run python -m godox_ul60bi_bt parse-capture captures/godox-att-writes.json --format markdown
-```
-
-See [captures/README.md](captures/README.md) for the full Android capture
-workflow.
-
-### Raw Writes
-
-Raw writes are for confirmed packets captured from the official app.
-
-```bash
-uv run python -m godox_ul60bi_bt raw --device <device-id> --char <uuid> --hex <payload-hex>
-```
-
-Use this only after the characteristic and bytes are confirmed from captured app
-traffic.
+Light control uses a Telink LE vendor model (company ID `0x0211`, model ID
+`0x0000`). The access layer opcode is `0x00F011` (3 bytes, LE). The payload
+encodes brightness, CCT, and a CRC-8 check byte.
 
 ## Troubleshooting
 
-### Commands appear to have no effect
+### Commands appear to have no effect (RPL rejection)
 
-The most likely cause is Replay Protection List (RPL) rejection.
+The device silently drops PDUs with a sequence number at or below its stored
+high-water mark (Replay Protection List). If you used the Godox app before,
+bump the sequence number:
 
-The device maintains a per-source high-water mark for sequence numbers. Any
-incoming mesh PDU with a sequence number at or below the stored high-water mark
-is silently dropped. There is no error and no acknowledgment.
-
-This happens whenever:
-
-- The Godox Light Android/iOS app was used before your Python session.
-- `mesh_state.json` has a `sequence_number` that is too low.
-
-Fix this by bumping `sequence_number` in `mesh_state.json` well above the last
-value used by the app. Setting it to `300000` or higher is safe for current
-captures.
-
-```json
-{ "sequence_number": 300000 }
+```bash
+godox-ul60bi set --seq-bump 50000 --brightness 80 --cct 4000
 ```
 
-After using the Godox app again, bump `sequence_number` again before the next
-Python control call.
+Or edit `sequence_number` in `mesh_state.json` directly.
 
 ### Proxy Filter Status acknowledgment is missing
 
-This is normal for standalone reconnect sessions. The device only sends Proxy
-Filter Status during the same BLE session as provisioning. In subsequent
-sessions it silently accepts the proxy config PDUs, unless RPL rejects them.
+Normal behavior. The device only sends Proxy Filter Status ACKs during the
+original provisioning session. Subsequent sessions silently accept proxy config
+PDUs. This is logged at DEBUG level, not WARNING.
+
+### Need to re-provision
+
+Factory-reset the light (hold the power button until it flashes), then:
+
+```bash
+godox-ul60bi provision
+godox-ul60bi rebind
+```
 
 ## Development
-
-This project uses `uv`.
 
 ```bash
 uv run pytest
@@ -262,10 +300,4 @@ uv run ruff check .
 uv run ty check
 ```
 
-Dependencies should be added with `uv add` or `uv add --dev`; do not edit
-dependency entries in `pyproject.toml` directly.
-
-## Hardware Workflows
-
-- [Bluetooth troubleshooting](docs/troubleshooting.md)
-- [Hardware smoke tests](docs/hardware-tests.md)
+Add dependencies with `uv add` or `uv add --dev`.

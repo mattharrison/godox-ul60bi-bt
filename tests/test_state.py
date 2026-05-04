@@ -28,6 +28,37 @@ def test_mesh_state_round_trips_through_json(tmp_path) -> None:
     assert MeshState.load(path) == state
 
 
+def test_mesh_state_device_address_round_trips(tmp_path) -> None:
+    state = MeshState(
+        network_key="125b33087af5d8f300114c2d4891378b",
+        app_key="414bf26e7af1eb6a0f642628470ebf8d",
+        provisioner_address=1,
+        node_address=2,
+        sequence_number=256,
+        iv_index=0,
+        device_address="304BCD50-D2C2-4FA6-A666-F4867E54F267",
+    )
+
+    path = tmp_path / "state.json"
+    state.save(path)
+    loaded = MeshState.load(path)
+
+    assert loaded.device_address == "304BCD50-D2C2-4FA6-A666-F4867E54F267"
+    assert loaded == state
+
+
+def test_mesh_state_device_address_defaults_to_empty() -> None:
+    state = MeshState(
+        network_key="125b33087af5d8f300114c2d4891378b",
+        app_key="414bf26e7af1eb6a0f642628470ebf8d",
+        provisioner_address=1,
+        node_address=2,
+        sequence_number=1,
+        iv_index=0,
+    )
+    assert state.device_address == ""
+
+
 def test_mesh_state_next_sequence_increments() -> None:
     state = MeshState(
         network_key="125b33087af5d8f300114c2d4891378b",

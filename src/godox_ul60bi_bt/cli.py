@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import json
 import sys
@@ -25,7 +26,8 @@ from godox_ul60bi_bt.crypto import build_vendor_access_payload, pack_proxy_netwo
 from godox_ul60bi_bt.logging_utils import configure_logging
 from godox_ul60bi_bt.inspector import InspectionResult, inspect_device
 from godox_ul60bi_bt.protocol import build_v2_command, validate_brightness, validate_cct
-from godox_ul60bi_bt.scanner import DiscoveredDevice, scan
+from godox_ul60bi_bt.provisioning import ProvisioningSession
+from godox_ul60bi_bt.scanner import DiscoveredDevice, scan, scan_unprovisioned
 from godox_ul60bi_bt.state import MeshState, import_mesh_state, resolve_mesh_state_path, save_default_mesh_state
 
 logger = logging.getLogger(__name__)
@@ -114,6 +116,8 @@ def main(
             return _raw(args, scan_fn, client_factory)
         if args.command == "rebind":
             return _cmd_rebind(args, scan_fn)
+        if args.command == "provision":
+            return _cmd_provision(args)
     except MeshStateNotFoundError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -204,6 +208,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Add N to sequence number before connecting (use if device ignores commands due to RPL)",
     )
 
+    provision_parser = subparsers.add_parser(
+        "provision",
+        parents=[subcommand_verbose_parent],
+        help="Provision a factory-reset Godox light",
+    )
+    provision_parser.add_argument("--address", help="BLE address (skip scan if provided)")
+    provision_parser.add_argument("--net-key", dest="net_key", help="Network key hex (default: random)")
+    provision_parser.add_argument("--app-key", dest="app_key", help="App key hex (default: random)")
+    provision_parser.add_argument("--node-addr", dest="node_addr", type=int, default=2)
+    provision_parser.add_argument("--output", default="mesh_state.json")
+    provision_parser.add_argument("--timeout", type=float, default=10.0)
+
     return parser
 
 
@@ -286,13 +302,26 @@ async def _ensure_device(args: argparse.Namespace, scan_fn: ScanFn) -> str:
 
 
 async def _get_controller(args: argparse.Namespace, scan_fn: ScanFn) -> GodoxController:
-    device = await _ensure_device(args, scan_fn)
-
     state_path = resolve_mesh_state_path(args.state)
     if state_path is None:
         raise MeshStateNotFoundError(_missing_state_message())
     if not state_path.exists():
         raise MeshStateNotFoundError(_missing_state_message())
+
+    # Use device_address cached in state as a fast-path (skip scan).
+    if not args.device:
+        cached = MeshState.load(state_path).device_address
+        if cached:
+            args.device = cached
+
+    device = await _ensure_device(args, scan_fn)
+
+    # After scan, persist the discovered address for future fast-path use.
+    if not getattr(args, "dry_run", False):
+        state = MeshState.load(state_path)
+        if state.device_address != device:
+            dataclasses.replace(state, device_address=device).save(state_path)
+            logger.debug("device_address %s saved to state", device)
 
     seq_bump = getattr(args, "seq_bump", 0)
     if seq_bump > 0:
@@ -327,6 +356,8 @@ def _apply_mesh_overrides(state: MeshState, args: argparse.Namespace) -> MeshSta
     return MeshState(
         network_key=state.network_key if args.network_key is None else args.network_key,
         app_key=state.app_key if args.app_key is None else args.app_key,
+        device_key=state.device_key,
+        device_address=state.device_address,
         provisioner_address=state.provisioner_address
         if args.provisioner_address is None
         else args.provisioner_address,
@@ -466,6 +497,55 @@ def _cmd_rebind(args: argparse.Namespace, scan_fn: ScanFn) -> int:
 
     asyncio.run(_do_rebind())
     return 0
+
+
+def _cmd_provision(args: argparse.Namespace) -> int:
+    import dataclasses
+    import os
+
+    net_key = bytes.fromhex(args.net_key) if args.net_key else os.urandom(16)
+    app_key = bytes.fromhex(args.app_key) if args.app_key else os.urandom(16)
+
+    async def _run() -> None:
+        address = args.address
+        if not address:
+            print("Scanning for unprovisioned devices...")
+            devices = await scan_unprovisioned(timeout=args.timeout)
+            if not devices:
+                print("No unprovisioned devices found. Factory-reset the light and try again.")
+                return
+            device = devices[0]
+            print(f"Found {device.name} ({device.address})")
+            address = device.address
+
+        print(f"Provisioning {address}...")
+        session = ProvisioningSession(
+            address=address,
+            net_key=net_key,
+            key_index=0,
+            iv_index=0,
+            unicast_address=args.node_addr,
+        )
+        state = await session.run()
+        state = dataclasses.replace(state, app_key=app_key.hex())
+        state.save(args.output)
+        print(f"✓ Provisioned! State saved to {args.output}")
+        print(f"  Device key: {state.device_key}")
+        print(f"  Node address: {state.node_address:#06x}")
+        print()
+        print("Next: run 'godox-ul60bi rebind' to push the app key to the device.")
+
+    asyncio.run(_run())
+    return 0
+
+
+def sync_main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI synchronously; thin wrapper around :func:`main`.
+
+    Exists so tests can monkeypatch module-level names (e.g.
+    ``godox_ul60bi_bt.cli.ProvisioningSession``) before dispatching.
+    """
+    return main(argv)
 
 
 def run() -> None:

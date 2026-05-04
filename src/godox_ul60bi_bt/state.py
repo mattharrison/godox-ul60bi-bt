@@ -67,6 +67,7 @@ class MeshState:
     sequence_number: int
     iv_index: int
     device_key: str = ""
+    device_address: str = ""
 
     def __post_init__(self) -> None:
         for key_name, value in {"network_key": self.network_key, "app_key": self.app_key}.items():
@@ -96,6 +97,7 @@ class MeshState:
             "network_key": self.network_key,
             "app_key": self.app_key,
             "device_key": self.device_key,
+            "device_address": self.device_address,
             "provisioner_address": self.provisioner_address,
             "node_address": self.node_address,
             "sequence_number": self.sequence_number,
@@ -144,6 +146,7 @@ class MeshState:
             "network_key",
             "app_key",
             "device_key",
+            "device_address",
             "provisioner_address",
             "node_address",
             "sequence_number",
@@ -226,6 +229,7 @@ class MeshState:
             network_key=self.network_key,
             app_key=self.app_key,
             device_key=self.device_key,
+            device_address=self.device_address,
             provisioner_address=self.provisioner_address,
             node_address=self.node_address,
             sequence_number=self.sequence_number + amount,

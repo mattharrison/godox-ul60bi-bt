@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from godox_ul60bi_bt.controller import (
     CONTROL_SETTLE_SECONDS,
@@ -453,3 +453,30 @@ async def test_controller_connect_proxy_ack_timeout_logs_at_debug_not_warning(
     assert not warning_ack_records, (
         f"proxy ack timeout must not produce WARNING: {[r.message for r in warning_ack_records]}"
     )
+
+
+@pytest.mark.asyncio
+async def test_rebind_delegates_to_config_session(tmp_path, mesh_state) -> None:
+    """rebind() delegates to ConfigSession.run()."""
+    device_key_state = MeshState(
+        network_key=mesh_state.network_key,
+        app_key=mesh_state.app_key,
+        provisioner_address=mesh_state.provisioner_address,
+        node_address=mesh_state.node_address,
+        sequence_number=mesh_state.sequence_number,
+        iv_index=mesh_state.iv_index,
+        device_key="aa" * 16,
+    )
+    state_file = tmp_path / "mesh_state.json"
+    device_key_state.save(state_file)
+
+    ran: list[str] = []
+
+    async def fake_run(self) -> None:
+        ran.append(self.address)
+
+    with patch("godox_ul60bi_bt.config_session.ConfigSession.run", fake_run):
+        controller = GodoxController("AA:BB:CC:DD:EE:FF", state_file)
+        await controller.rebind()
+
+    assert ran == ["AA:BB:CC:DD:EE:FF"]
