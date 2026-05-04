@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Mesh state contains live crypto keys — keep out of version control
+mesh_state.json
+
+context/
+
+# Raw BLE captures contain key material and device identifiers
+captures/
+
+# Build artifacts
