@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+REFERENCE_PDU_PATH = Path(__file__).parent / "fixtures" / "reference-pdu.hex"
+
+
 def test_build_vendor_access_payload() -> None:
     # Godox V2 payload (Power On)
     godox_payload = bytes.fromhex("FE00FFFFFFFFFF7F")
@@ -37,6 +42,5 @@ def test_pack_vendor_proxy_pdu() -> None:
         ttl=4,
     )
 
-    with open("captures/reference-pdu.hex", "r") as f:
-        expected_hex = f.read().strip()
+    expected_hex = REFERENCE_PDU_PATH.read_text().strip()
     assert proxy_pdu.hex().lower() == expected_hex.lower()

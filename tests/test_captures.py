@@ -12,7 +12,7 @@ from godox_ul60bi_bt.research.parse_capture import (
 )
 
 
-FIXTURE_PATH = Path(__file__).parent / "fixtures" / "captures" / "tshark-att-writes.json"
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "tshark-att-writes.json"
 
 
 def test_extract_att_write_packets_from_tshark_json() -> None:

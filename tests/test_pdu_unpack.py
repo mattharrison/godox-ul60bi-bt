@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from godox_ul60bi_bt.crypto import (
     k2,
 )
 
+REFERENCE_PDU_PATH = Path(__file__).parent / "fixtures" / "reference-pdu.hex"
+
 
 def test_decode_reference_pdu() -> None:
     # Load reference PDU
-    with open("captures/reference-pdu.hex", "r") as f:
-        pdu_hex = f.read().strip()
+    pdu_hex = REFERENCE_PDU_PATH.read_text().strip()
     pdu = bytes.fromhex(pdu_hex)
 
     # Reference keys

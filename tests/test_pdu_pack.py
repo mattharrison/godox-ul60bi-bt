@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from godox_ul60bi_bt.crypto import (
     k2,
 )
+
+REFERENCE_PDU_PATH = Path(__file__).parent / "fixtures" / "reference-pdu.hex"
 
 
 def test_pack_reference_pdu() -> None:
@@ -55,8 +59,7 @@ def test_pack_reference_pdu() -> None:
         ttl,
     )
 
-    with open("captures/reference-pdu.hex", "r") as f:
-        expected_hex = f.read().strip()
+    expected_hex = REFERENCE_PDU_PATH.read_text().strip()
     assert proxy_pdu.hex().lower() == expected_hex.lower()
 
 
